@@ -1,0 +1,44 @@
+# Terraform
+terraform/.terraform/
+terraform/*.tfstate
+terraform/*.tfstate.backup
+terraform/.terraform.lock.hcl
+
+# Node
+app/web/node_modules/
+app/api/node_modules/
+node_modules/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Environment & secrets
+.env
+*.pem
+*.key
+k8s/base/db-secret.yaml
+FULL_CONTEXT.md
+
+# Terraform plans (may contain sensitive values)
+terraform/tfplan
+terraform/*.tfplan
+
+# AWS credentials & exports
+*.csv
+
+# Downloaded Grafana dashboards (provisioned via ConfigMaps)
+k8s/monitoring/dashboards/
+
+# Assessment / docs
+*.pdf
+
+# Binaries
+*.exe
+
+# Misc
+nul

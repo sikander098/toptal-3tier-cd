@@ -1,0 +1,29 @@
+# Git
+.git
+.gitignore
+
+# Terraform
+terraform/.terraform
+terraform/*.tfstate
+terraform/*.tfstate.backup
+terraform/tfplan
+
+# Node modules (rebuilt in container)
+app/web/node_modules
+app/api/node_modules
+node_modules
+
+# IDE & OS
+.vscode
+.idea
+.DS_Store
+Thumbs.db
+
+# Docs & configs not needed in image
+README.md
+FULL_CONTEXT.md
+*.md
+configs/
+scripts/
+k8s/
+.github/
