@@ -1,0 +1,92 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  AWS_REGION: us-east-1
+  EKS_CLUSTER: toptal-3tier-eks
+  ECR_WEB: 453410498558.dkr.ecr.us-east-1.amazonaws.com/toptal-3tier-web
+  ECR_API: 453410498558.dkr.ecr.us-east-1.amazonaws.com/toptal-3tier-api
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - name: Install and test web
+        working-directory: app/web
+        run: |
+          npm install
+          npm test
+
+      - name: Install and test api
+        working-directory: app/api
+        run: |
+          npm install
+          npm test
+
+  build-and-deploy:
+    name: Build & Deploy
+    needs: test
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Web image
+        run: |
+          docker build -t $ECR_WEB:${{ github.sha }} -t $ECR_WEB:latest -f docker/web/Dockerfile .
+          docker push $ECR_WEB:${{ github.sha }}
+          docker push $ECR_WEB:latest
+
+      - name: Build and push API image
+        run: |
+          docker build -t $ECR_API:${{ github.sha }} -t $ECR_API:latest -f docker/api/Dockerfile .
+          docker push $ECR_API:${{ github.sha }}
+          docker push $ECR_API:latest
+
+      - name: Configure kubectl
+        run: |
+          aws eks update-kubeconfig --name $EKS_CLUSTER --region $AWS_REGION
+
+      - name: Install Argo Rollouts kubectl plugin
+        run: |
+          curl -LO https://github.com/argoproj/argo-rollouts/releases/latest/download/kubectl-argo-rollouts-linux-amd64
+          chmod +x kubectl-argo-rollouts-linux-amd64
+          sudo mv kubectl-argo-rollouts-linux-amd64 /usr/local/bin/kubectl-argo-rollouts
+
+      - name: Deploy API (Canary via Argo Rollouts)
+        run: |
+          kubectl-argo-rollouts set image api api=$ECR_API:${{ github.sha }} -n toptal
+          kubectl-argo-rollouts status api -n toptal --timeout 300s
+
+      - name: Deploy Web (Canary via Argo Rollouts)
+        run: |
+          kubectl-argo-rollouts set image web web=$ECR_WEB:${{ github.sha }} -n toptal
+          kubectl-argo-rollouts status web -n toptal --timeout 300s
+
+      - name: Verify deployment
+        run: |
+          kubectl-argo-rollouts get rollout api -n toptal
+          kubectl-argo-rollouts get rollout web -n toptal
+          kubectl get pods -n toptal
