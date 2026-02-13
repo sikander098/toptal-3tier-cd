@@ -1,0 +1,100 @@
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: canary-health-check
+  namespace: toptal
+spec:
+  args:
+    - name: app-name
+  metrics:
+    # 1. Container restart rate — detects crash loops
+    #    Fail if more than 1 restart in a 2-minute window
+    - name: restart-rate
+      interval: 15s
+      count: 4
+      successCondition: result[0] < 2
+      failureLimit: 1
+      provider:
+        prometheus:
+          address: http://prometheus.monitoring.svc.cluster.local:9090
+          query: |
+            sum(increase(kube_pod_container_status_restarts_total{
+              namespace="toptal",
+              pod=~"{{args.app-name}}.*"
+            }[2m])) OR vector(0)
+
+    # 2. Pod readiness — ensures canary pods are actually serving traffic
+    #    Fail if any canary pod is not ready
+    - name: pod-readiness
+      interval: 15s
+      count: 4
+      successCondition: result[0] >= 1
+      failureLimit: 2
+      provider:
+        prometheus:
+          address: http://prometheus.monitoring.svc.cluster.local:9090
+          query: |
+            sum(kube_pod_status_ready{
+              namespace="toptal",
+              pod=~"{{args.app-name}}.*",
+              condition="true"
+            }) OR vector(1)
+
+    # 3. OOM kill detection — catches memory leaks early
+    #    Fail if any container is OOM killed during canary
+    - name: oom-kill
+      interval: 15s
+      count: 4
+      successCondition: result[0] == 0
+      failureLimit: 1
+      provider:
+        prometheus:
+          address: http://prometheus.monitoring.svc.cluster.local:9090
+          query: |
+            sum(increase(kube_pod_container_status_last_terminated_reason{
+              namespace="toptal",
+              pod=~"{{args.app-name}}.*",
+              reason="OOMKilled"
+            }[2m])) OR vector(0)
+
+    # 4. CPU saturation — detects canary consuming excessive CPU
+    #    Fail if canary pods use more than 90% of CPU limit
+    - name: cpu-saturation
+      interval: 15s
+      count: 4
+      successCondition: result[0] < 90
+      failureLimit: 2
+      provider:
+        prometheus:
+          address: http://prometheus.monitoring.svc.cluster.local:9090
+          query: |
+            (sum(rate(container_cpu_usage_seconds_total{
+              namespace="toptal",
+              pod=~"{{args.app-name}}.*",
+              container!="", container!="POD"
+            }[2m])) / sum(kube_pod_container_resource_limits{
+              namespace="toptal",
+              pod=~"{{args.app-name}}.*",
+              resource="cpu"
+            })) * 100 OR vector(0)
+
+    # 5. Memory saturation — detects canary approaching memory limit
+    #    Fail if canary pods use more than 90% of memory limit
+    - name: memory-saturation
+      interval: 15s
+      count: 4
+      successCondition: result[0] < 90
+      failureLimit: 2
+      provider:
+        prometheus:
+          address: http://prometheus.monitoring.svc.cluster.local:9090
+          query: |
+            (sum(container_memory_working_set_bytes{
+              namespace="toptal",
+              pod=~"{{args.app-name}}.*",
+              container!="", container!="POD"
+            }) / sum(kube_pod_container_resource_limits{
+              namespace="toptal",
+              pod=~"{{args.app-name}}.*",
+              resource="memory"
+            })) * 100 OR vector(0)
