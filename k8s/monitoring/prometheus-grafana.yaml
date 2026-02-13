@@ -1,0 +1,802 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: monitoring
+---
+# Prometheus ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: monitoring
+data:
+  alert-rules.yml: |
+    groups:
+      - name: application-alerts
+        rules:
+          # Pod crash looping — more than 3 restarts in 10 minutes
+          - alert: PodCrashLooping
+            expr: increase(kube_pod_container_status_restarts_total{namespace="toptal"}[10m]) > 3
+            for: 2m
+            labels:
+              severity: critical
+            annotations:
+              summary: "Pod {{ $labels.pod }} is crash looping"
+              description: "Pod {{ $labels.pod }} in namespace {{ $labels.namespace }} has restarted {{ $value }} times in the last 10 minutes."
+
+          # Pod not ready for more than 5 minutes
+          - alert: PodNotReady
+            expr: kube_pod_status_ready{namespace="toptal", condition="true"} == 0
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "Pod {{ $labels.pod }} is not ready"
+              description: "Pod {{ $labels.pod }} has been in a non-ready state for more than 5 minutes."
+
+          # High CPU usage — pod using > 80% of its limit
+          - alert: HighCPUUsage
+            expr: (sum(rate(container_cpu_usage_seconds_total{namespace="toptal", container!="", container!="POD"}[5m])) by (pod) / sum(kube_pod_container_resource_limits{namespace="toptal", resource="cpu"}) by (pod)) * 100 > 80
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "High CPU usage on pod {{ $labels.pod }}"
+              description: "Pod {{ $labels.pod }} is using {{ $value }}% of its CPU limit for more than 5 minutes."
+
+          # High memory usage — pod using > 85% of its limit
+          - alert: HighMemoryUsage
+            expr: (sum(container_memory_working_set_bytes{namespace="toptal", container!="", container!="POD"}) by (pod) / sum(kube_pod_container_resource_limits{namespace="toptal", resource="memory"}) by (pod)) * 100 > 85
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "High memory usage on pod {{ $labels.pod }}"
+              description: "Pod {{ $labels.pod }} is using {{ $value }}% of its memory limit for more than 5 minutes."
+
+          # OOM killed container
+          - alert: ContainerOOMKilled
+            expr: increase(kube_pod_container_status_last_terminated_reason{namespace="toptal", reason="OOMKilled"}[5m]) > 0
+            for: 0m
+            labels:
+              severity: critical
+            annotations:
+              summary: "Container {{ $labels.container }} OOM killed"
+              description: "Container {{ $labels.container }} in pod {{ $labels.pod }} was OOM killed."
+
+      - name: infrastructure-alerts
+        rules:
+          # Node CPU > 85% for 10 minutes
+          - alert: HighNodeCPU
+            expr: 100 - (avg by(instance)(rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 85
+            for: 10m
+            labels:
+              severity: warning
+            annotations:
+              summary: "High CPU on node {{ $labels.instance }}"
+              description: "Node {{ $labels.instance }} CPU usage is {{ $value }}% for more than 10 minutes."
+
+          # Node memory > 90% for 5 minutes
+          - alert: HighNodeMemory
+            expr: 100 * (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) > 90
+            for: 5m
+            labels:
+              severity: critical
+            annotations:
+              summary: "High memory on node {{ $labels.instance }}"
+              description: "Node {{ $labels.instance }} memory usage is {{ $value }}%."
+
+          # Persistent volume > 80% full
+          - alert: PersistentVolumeFillingUp
+            expr: kubelet_volume_stats_used_bytes / kubelet_volume_stats_capacity_bytes * 100 > 80
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "PV {{ $labels.persistentvolumeclaim }} is filling up"
+              description: "PV {{ $labels.persistentvolumeclaim }} is {{ $value }}% full."
+
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+
+    alerting:
+      alertmanagers:
+        - static_configs:
+            - targets: ['alertmanager:9093']
+
+    rule_files:
+      - /etc/prometheus/alert-rules.yml
+
+    scrape_configs:
+      - job_name: 'kubernetes-pods'
+        kubernetes_sd_configs:
+          - role: pod
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: true
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: (.+)
+          - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+            action: replace
+            regex: ([^:]+)(?::\d+)?;(\d+)
+            replacement: $1:$2
+            target_label: __address__
+
+      - job_name: 'kubernetes-nodes'
+        scheme: https
+        tls_config:
+          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        kubernetes_sd_configs:
+          - role: node
+        relabel_configs:
+          - action: labelmap
+            regex: __meta_kubernetes_node_label_(.+)
+          - target_label: __address__
+            replacement: kubernetes.default.svc:443
+          - source_labels: [__meta_kubernetes_node_name]
+            regex: (.+)
+            target_label: __metrics_path__
+            replacement: /api/v1/nodes/${1}/proxy/metrics
+
+      - job_name: 'kubernetes-cadvisor'
+        scheme: https
+        tls_config:
+          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        kubernetes_sd_configs:
+          - role: node
+        relabel_configs:
+          - action: labelmap
+            regex: __meta_kubernetes_node_label_(.+)
+          - target_label: __address__
+            replacement: kubernetes.default.svc:443
+          - source_labels: [__meta_kubernetes_node_name]
+            regex: (.+)
+            target_label: __metrics_path__
+            replacement: /api/v1/nodes/${1}/proxy/metrics/cadvisor
+
+      - job_name: 'kube-state-metrics'
+        static_configs:
+          - targets: ['kube-state-metrics.monitoring.svc.cluster.local:8080']
+
+      - job_name: 'node-exporter'
+        kubernetes_sd_configs:
+          - role: endpoints
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_service_label_app_kubernetes_io_name]
+            action: keep
+            regex: prometheus-node-exporter
+          - source_labels: [__meta_kubernetes_endpoint_port_name]
+            action: keep
+            regex: metrics
+
+      - job_name: 'kubernetes-service-endpoints'
+        kubernetes_sd_configs:
+          - role: endpoints
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_scrape]
+            action: keep
+            regex: true
+---
+# Prometheus RBAC
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+  namespace: monitoring
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: prometheus
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "nodes/proxy", "services", "endpoints", "pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["extensions"]
+    resources: ["ingresses"]
+    verbs: ["get", "list", "watch"]
+  - nonResourceURLs: ["/metrics"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: prometheus
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: prometheus
+subjects:
+  - kind: ServiceAccount
+    name: prometheus
+    namespace: monitoring
+---
+# Prometheus Persistent Storage
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: prometheus-data
+  namespace: monitoring
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: gp2
+  resources:
+    requests:
+      storage: 10Gi
+---
+# Prometheus Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+    spec:
+      serviceAccountName: prometheus
+      securityContext:
+        fsGroup: 65534
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v2.51.0
+          ports:
+            - containerPort: 9090
+          args:
+            - "--config.file=/etc/prometheus/prometheus.yml"
+            - "--storage.tsdb.retention.time=7d"
+          volumeMounts:
+            - name: config
+              mountPath: /etc/prometheus/
+            - name: data
+              mountPath: /prometheus
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+      volumes:
+        - name: config
+          configMap:
+            name: prometheus-config
+        - name: data
+          persistentVolumeClaim:
+            claimName: prometheus-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: monitoring
+spec:
+  selector:
+    app: prometheus
+  ports:
+    - port: 9090
+      targetPort: 9090
+  type: ClusterIP
+---
+# Grafana Datasource Provisioning
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-datasources
+  namespace: monitoring
+data:
+  datasources.yaml: |
+    apiVersion: 1
+    datasources:
+      - name: Prometheus
+        type: prometheus
+        access: proxy
+        url: http://prometheus:9090
+        isDefault: true
+        editable: true
+      - name: CloudWatch
+        type: cloudwatch
+        access: proxy
+        jsonData:
+          authType: default
+          defaultRegion: us-east-1
+        editable: true
+---
+# Grafana Dashboard Provisioning
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-providers
+  namespace: monitoring
+data:
+  dashboards.yaml: |
+    apiVersion: 1
+    providers:
+      - name: 'custom'
+        orgId: 1
+        folder: 'Custom'
+        type: file
+        disableDeletion: false
+        editable: true
+        options:
+          path: /var/lib/grafana/dashboards/custom
+      - name: 'node-exporter'
+        orgId: 1
+        folder: 'Infrastructure'
+        type: file
+        disableDeletion: false
+        editable: true
+        options:
+          path: /var/lib/grafana/dashboards/node-exporter
+      - name: 'kubernetes'
+        orgId: 1
+        folder: 'Kubernetes'
+        type: file
+        disableDeletion: false
+        editable: true
+        options:
+          path: /var/lib/grafana/dashboards/kubernetes
+---
+# K8s Overview Dashboard
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboards
+  namespace: monitoring
+data:
+  k8s-overview.json: |
+    {
+      "annotations": { "list": [] },
+      "editable": true,
+      "fiscalYearStartMonth": 0,
+      "graphTooltip": 1,
+      "id": null,
+      "links": [],
+      "panels": [
+        {
+          "title": "METRICS",
+          "type": "row",
+          "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+          "collapsed": false
+        },
+        {
+          "title": "Pod CPU Usage (toptal namespace)",
+          "type": "timeseries",
+          "datasource": "Prometheus",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 1 },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": { "fillOpacity": 15, "lineWidth": 2 }
+            }
+          },
+          "targets": [
+            {
+              "expr": "sum(rate(container_cpu_usage_seconds_total{namespace=\"toptal\", container!=\"\", container!=\"POD\"}[5m])) by (pod)",
+              "legendFormat": "{{pod}}"
+            }
+          ]
+        },
+        {
+          "title": "Pod Memory Usage (toptal namespace)",
+          "type": "timeseries",
+          "datasource": "Prometheus",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 1 },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "bytes",
+              "custom": { "fillOpacity": 15, "lineWidth": 2 }
+            }
+          },
+          "targets": [
+            {
+              "expr": "sum(container_memory_working_set_bytes{namespace=\"toptal\", container!=\"\", container!=\"POD\"}) by (pod)",
+              "legendFormat": "{{pod}}"
+            }
+          ]
+        },
+        {
+          "title": "Pods Running",
+          "type": "stat",
+          "datasource": "Prometheus",
+          "gridPos": { "h": 6, "w": 4, "x": 0, "y": 9 },
+          "fieldConfig": {
+            "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "steps": [{"color": "green", "value": null}] } }
+          },
+          "targets": [
+            {
+              "expr": "count(kube_pod_status_phase{phase=\"Running\", namespace=\"toptal\"})",
+              "legendFormat": "Running Pods"
+            }
+          ]
+        },
+        {
+          "title": "Pods Ready",
+          "type": "stat",
+          "datasource": "Prometheus",
+          "gridPos": { "h": 6, "w": 4, "x": 4, "y": 9 },
+          "fieldConfig": {
+            "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "steps": [{"color": "green", "value": null}] } }
+          },
+          "targets": [
+            {
+              "expr": "sum(kube_pod_status_ready{namespace=\"toptal\", condition=\"true\"})",
+              "legendFormat": "Ready"
+            }
+          ]
+        },
+        {
+          "title": "Container Restarts",
+          "type": "stat",
+          "datasource": "Prometheus",
+          "gridPos": { "h": 6, "w": 4, "x": 8, "y": 9 },
+          "fieldConfig": {
+            "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 3}, {"color": "red", "value": 10}] } }
+          },
+          "targets": [
+            {
+              "expr": "sum(kube_pod_container_status_restarts_total{namespace=\"toptal\"})",
+              "legendFormat": "Restarts"
+            }
+          ]
+        },
+        {
+          "title": "Node CPU %",
+          "type": "gauge",
+          "datasource": "Prometheus",
+          "gridPos": { "h": 6, "w": 6, "x": 12, "y": 9 },
+          "fieldConfig": {
+            "defaults": { "unit": "percent", "min": 0, "max": 100, "thresholds": { "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 60}, {"color": "red", "value": 85}] } }
+          },
+          "targets": [
+            {
+              "expr": "100 - (avg by(instance)(rate(node_cpu_seconds_total{mode=\"idle\"}[5m])) * 100)",
+              "legendFormat": "{{instance}}"
+            }
+          ]
+        },
+        {
+          "title": "Node Memory %",
+          "type": "gauge",
+          "datasource": "Prometheus",
+          "gridPos": { "h": 6, "w": 6, "x": 18, "y": 9 },
+          "fieldConfig": {
+            "defaults": { "unit": "percent", "min": 0, "max": 100, "thresholds": { "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 70}, {"color": "red", "value": 90}] } }
+          },
+          "targets": [
+            {
+              "expr": "100 * (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes))",
+              "legendFormat": "{{instance}}"
+            }
+          ]
+        },
+        {
+          "title": "Network I/O - Received (toptal)",
+          "type": "timeseries",
+          "datasource": "Prometheus",
+          "gridPos": { "h": 7, "w": 12, "x": 0, "y": 15 },
+          "fieldConfig": {
+            "defaults": { "unit": "Bps", "custom": { "fillOpacity": 10, "lineWidth": 2 } }
+          },
+          "targets": [
+            {
+              "expr": "sum(rate(container_network_receive_bytes_total{namespace=\"toptal\"}[5m])) by (pod)",
+              "legendFormat": "{{pod}} rx"
+            }
+          ]
+        },
+        {
+          "title": "Network I/O - Transmitted (toptal)",
+          "type": "timeseries",
+          "datasource": "Prometheus",
+          "gridPos": { "h": 7, "w": 12, "x": 12, "y": 15 },
+          "fieldConfig": {
+            "defaults": { "unit": "Bps", "custom": { "fillOpacity": 10, "lineWidth": 2 } }
+          },
+          "targets": [
+            {
+              "expr": "sum(rate(container_network_transmit_bytes_total{namespace=\"toptal\"}[5m])) by (pod)",
+              "legendFormat": "{{pod}} tx"
+            }
+          ]
+        },
+        {
+          "title": "LOGS",
+          "type": "row",
+          "gridPos": { "h": 1, "w": 24, "x": 0, "y": 22 },
+          "collapsed": false
+        },
+        {
+          "title": "Application Logs (All Pods)",
+          "type": "logs",
+          "datasource": "CloudWatch",
+          "gridPos": { "h": 12, "w": 24, "x": 0, "y": 23 },
+          "targets": [
+            {
+              "queryMode": "Logs",
+              "logGroupNames": ["/eks/toptal-3tier"],
+              "expression": "parse @message '\"log\":\"*\"' as log_line | parse @message '\"pod_name\":\"*\"' as pod | parse @message '\"namespace_name\":\"*\"' as ns | filter ns = 'toptal' | display @timestamp, pod, log_line | sort @timestamp desc | limit 100",
+              "region": "us-east-1"
+            }
+          ],
+          "options": {
+            "showTime": true,
+            "sortOrder": "Descending",
+            "enableLogDetails": true,
+            "dedupStrategy": "none",
+            "wrapLogMessage": true,
+            "prettifyLogMessage": false
+          }
+        },
+        {
+          "title": "API Tier Logs",
+          "type": "logs",
+          "datasource": "CloudWatch",
+          "gridPos": { "h": 10, "w": 12, "x": 0, "y": 35 },
+          "targets": [
+            {
+              "queryMode": "Logs",
+              "logGroupNames": ["/eks/toptal-3tier"],
+              "expression": "parse @message '\"log\":\"*\"' as log_line | parse @message '\"pod_name\":\"*\"' as pod | parse @message '\"namespace_name\":\"*\"' as ns | parse @message '\"container_name\":\"*\"' as container | filter ns = 'toptal' and container = 'api' | display @timestamp, pod, log_line | sort @timestamp desc | limit 50",
+              "region": "us-east-1"
+            }
+          ],
+          "options": {
+            "showTime": true,
+            "sortOrder": "Descending",
+            "enableLogDetails": true,
+            "wrapLogMessage": true
+          }
+        },
+        {
+          "title": "Web Tier Logs",
+          "type": "logs",
+          "datasource": "CloudWatch",
+          "gridPos": { "h": 10, "w": 12, "x": 12, "y": 35 },
+          "targets": [
+            {
+              "queryMode": "Logs",
+              "logGroupNames": ["/eks/toptal-3tier"],
+              "expression": "parse @message '\"log\":\"*\"' as log_line | parse @message '\"pod_name\":\"*\"' as pod | parse @message '\"namespace_name\":\"*\"' as ns | parse @message '\"container_name\":\"*\"' as container | filter ns = 'toptal' and container = 'web' | display @timestamp, pod, log_line | sort @timestamp desc | limit 50",
+              "region": "us-east-1"
+            }
+          ],
+          "options": {
+            "showTime": true,
+            "sortOrder": "Descending",
+            "enableLogDetails": true,
+            "wrapLogMessage": true
+          }
+        }
+      ],
+      "refresh": "10s",
+      "schemaVersion": 39,
+      "tags": ["kubernetes", "toptal"],
+      "templating": { "list": [] },
+      "time": { "from": "now-1h", "to": "now" },
+      "title": "Toptal 3-Tier - Kubernetes Overview",
+      "uid": "toptal-k8s-overview"
+    }
+---
+# Grafana Admin Credentials
+apiVersion: v1
+kind: Secret
+metadata:
+  name: grafana-credentials
+  namespace: monitoring
+type: Opaque
+stringData:
+  admin-password: "<GRAFANA_ADMIN_PASSWORD>"
+---
+# Grafana Persistent Storage
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: grafana-data
+  namespace: monitoring
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: gp2
+  resources:
+    requests:
+      storage: 5Gi
+---
+# Grafana Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: grafana
+  template:
+    metadata:
+      labels:
+        app: grafana
+    spec:
+      serviceAccountName: grafana
+      securityContext:
+        fsGroup: 472
+      containers:
+        - name: grafana
+          image: grafana/grafana:10.4.1
+          ports:
+            - containerPort: 3000
+          env:
+            - name: GF_SECURITY_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: grafana-credentials
+                  key: admin-password
+          volumeMounts:
+            - name: datasources
+              mountPath: /etc/grafana/provisioning/datasources
+            - name: dashboard-providers
+              mountPath: /etc/grafana/provisioning/dashboards
+            - name: dashboards-custom
+              mountPath: /var/lib/grafana/dashboards/custom
+            - name: dashboards-node-exporter
+              mountPath: /var/lib/grafana/dashboards/node-exporter
+            - name: dashboards-k8s-views
+              mountPath: /var/lib/grafana/dashboards/kubernetes
+            - name: grafana-storage
+              mountPath: /var/lib/grafana
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+      volumes:
+        - name: datasources
+          configMap:
+            name: grafana-datasources
+        - name: dashboard-providers
+          configMap:
+            name: grafana-dashboard-providers
+        - name: dashboards-custom
+          configMap:
+            name: grafana-dashboards
+        - name: dashboards-node-exporter
+          configMap:
+            name: grafana-dash-node-exporter
+        - name: dashboards-k8s-views
+          configMap:
+            name: grafana-dash-k8s-views
+        - name: grafana-storage
+          persistentVolumeClaim:
+            claimName: grafana-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+  namespace: monitoring
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: "external"
+    service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: "ip"
+    service.beta.kubernetes.io/aws-load-balancer-scheme: "internet-facing"
+spec:
+  selector:
+    app: grafana
+  ports:
+    - port: 80
+      targetPort: 3000
+  type: LoadBalancer
+---
+# Alertmanager Configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alertmanager-config
+  namespace: monitoring
+data:
+  alertmanager.yml: |
+    global:
+      smtp_smarthost: 'smtp.gmail.com:587'
+      smtp_from: 'alertmanager@toptal-3tier.com'
+      smtp_auth_username: 'sikanderhameed098@gmail.com'
+      smtp_auth_password_file: /etc/alertmanager/secrets/smtp-password
+      smtp_require_tls: true
+
+    route:
+      group_by: ['alertname', 'namespace']
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 4h
+      receiver: 'email-notifications'
+      routes:
+        - match:
+            severity: critical
+          receiver: 'email-notifications'
+          repeat_interval: 1h
+
+    receivers:
+      - name: 'email-notifications'
+        email_configs:
+          - to: 'sikanderhameed098@gmail.com'
+            send_resolved: true
+            headers:
+              Subject: '[Toptal-3Tier] {{ .GroupLabels.alertname }} - {{ .Status }}'
+
+    inhibit_rules:
+      - source_match:
+          severity: 'critical'
+        target_match:
+          severity: 'warning'
+        equal: ['alertname', 'namespace']
+---
+# Alertmanager Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alertmanager
+  namespace: monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: alertmanager
+  template:
+    metadata:
+      labels:
+        app: alertmanager
+    spec:
+      containers:
+        - name: alertmanager
+          image: prom/alertmanager:v0.27.0
+          ports:
+            - containerPort: 9093
+          args:
+            - "--config.file=/etc/alertmanager/alertmanager.yml"
+            - "--storage.path=/alertmanager"
+          volumeMounts:
+            - name: config
+              mountPath: /etc/alertmanager/
+            - name: data
+              mountPath: /alertmanager
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 100m
+              memory: 128Mi
+      volumes:
+        - name: config
+          configMap:
+            name: alertmanager-config
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alertmanager
+  namespace: monitoring
+spec:
+  selector:
+    app: alertmanager
+  ports:
+    - port: 9093
+      targetPort: 9093
+  type: ClusterIP
