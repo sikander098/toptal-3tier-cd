@@ -1,0 +1,37 @@
+# Resilience Policies — timeouts, retries, and circuit breaking
+# Prevent cascading failures across microservices
+---
+# Timeout — fail fast if reviews doesn't respond within 1s
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: reviews-timeout
+  namespace: learn
+spec:
+  hosts:
+    - reviews
+  http:
+    - timeout: 1s
+      route:
+        - destination:
+            host: reviews
+            subset: v1
+---
+# Retries — automatically retry on transient failures
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: reviews-retry
+  namespace: learn
+spec:
+  hosts:
+    - reviews
+  http:
+    - retries:
+        attempts: 3             # retry up to 3 times
+        perTryTimeout: 2s       # each attempt gets 2s max
+        retryOn: 5xx,reset,connect-failure
+      route:
+        - destination:
+            host: reviews
+            subset: v1

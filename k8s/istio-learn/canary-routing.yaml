@@ -1,0 +1,46 @@
+# Canary / Weighted Traffic Routing
+# Gradually shift traffic between service versions
+---
+# 80/20 weighted split — canary deployment pattern
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: reviews-canary
+  namespace: learn
+spec:
+  hosts:
+    - reviews
+  http:
+    - route:
+        - destination:
+            host: reviews
+            subset: v1
+          weight: 80
+        - destination:
+            host: reviews
+            subset: v3
+          weight: 20
+---
+# Header-based routing — route specific users to a version (A/B testing)
+# User "jason" sees reviews-v2 (black stars), everyone else sees v1
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: reviews-ab-test
+  namespace: learn
+spec:
+  hosts:
+    - reviews
+  http:
+    - match:
+        - headers:
+            end-user:
+              exact: jason
+      route:
+        - destination:
+            host: reviews
+            subset: v2
+    - route:
+        - destination:
+            host: reviews
+            subset: v1

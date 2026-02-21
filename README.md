@@ -34,6 +34,12 @@ flowchart TB
     ALB -- "/api/*" --> A1 & A2
     A1 & A2 --> RDS
 
+    subgraph Mesh ["Istio Service Mesh"]
+        mTLS[Strict mTLS]
+        CB[Circuit Breaking]
+        FI[Fault Injection]
+    end
+
     subgraph Monitoring ["Observability"]
         Prometheus[Prometheus] --> Grafana[Grafana Dashboards]
         Prometheus --> AM[Alertmanager]
@@ -46,6 +52,7 @@ flowchart TB
         Argo -- "Canary Deploy" --> EKS
     end
 
+    Mesh -.-> EKS
     Prometheus -.-> EKS
     FluentBit -.-> EKS
 ```
@@ -65,6 +72,7 @@ flowchart TB
 | **Centralized Logging** | Fluent Bit → CloudWatch |
 | **Metrics & Alerting** | Prometheus + Grafana + Alertmanager |
 | **Secrets Management** | AWS Secrets Manager + External Secrets Operator |
+| **Service Mesh** | Istio (mTLS, traffic shaping, fault injection, circuit breaking) |
 | **Backups** | RDS automated + manual snapshots via CronJob |
 
 ## Repository Structure
@@ -107,6 +115,14 @@ flowchart TB
 │   │   ├── fluent-bit.yaml             # Centralized logging → CloudWatch
 │   │   ├── grafana-trust-policy.json   # IRSA trust policy
 │   │   └── fluent-bit-trust-policy.json # IRSA trust policy
+│   ├── istio-learn/
+│   │   ├── bookinfo.yaml              # Istio Bookinfo sample app (4 microservices)
+│   │   ├── gateway.yaml               # Istio Gateway + ingress VirtualService
+│   │   ├── traffic-rules.yaml         # DestinationRules (subsets + circuit breaking)
+│   │   ├── canary-routing.yaml        # Weighted routing + header-based A/B testing
+│   │   ├── resilience.yaml            # Timeouts + retries
+│   │   ├── fault-injection.yaml       # Delay + abort fault injection (chaos testing)
+│   │   └── security.yaml             # Strict mTLS (PeerAuthentication)
 │   ├── aws-lb-controller-policy.json   # IAM policy for ALB controller
 │   └── iam_policy.json                 # AWS LB Controller IAM policy
 ├── .github/workflows/
@@ -294,6 +310,8 @@ flowchart TB
 - Database credentials stored in AWS Secrets Manager, synced via External Secrets Operator (IRSA-authenticated)
 - Grafana credentials stored in Kubernetes Secret (not hardcoded in manifests)
 - CloudFront enforces HTTPS with redirect
+- Istio strict mTLS: all service-to-service traffic encrypted (TLS 1.3) with auto-rotating certificates (24h expiry)
+- SPIFFE-based service identity for zero-trust pod-to-pod authentication
 
 ## Auto-Scaling
 
@@ -303,6 +321,64 @@ Horizontal Pod Autoscaler (HPA) configured for both web and API tiers:
 - **Scale down**: 5-minute stabilization window to prevent flapping
 - **Range**: 2–6 replicas per tier
 - **Behavior**: Scale up by 2 pods per minute, scale down by 1 pod per 2 minutes
+
+## Istio Service Mesh
+
+Istio service mesh provides traffic management, resilience, security, and observability across microservices — without modifying application code.
+
+### Traffic Management
+
+```mermaid
+flowchart LR
+    User([User]) --> GW[Istio Gateway]
+    GW --> VS[VirtualService]
+    VS -- "80%" --> V1[reviews-v1<br/>no stars]
+    VS -- "20%" --> V3[reviews-v3<br/>red stars]
+    VS -- "header: jason" --> V2[reviews-v2<br/>black stars]
+
+    style V1 fill:#2ea44f,color:#fff
+    style V2 fill:#0969da,color:#fff
+    style V3 fill:#d73a49,color:#fff
+```
+
+| Feature | Configuration | Purpose |
+|---------|--------------|---------|
+| **Weighted routing** | 80/20 split between v1 and v3 | Canary deployments — gradually shift traffic to new version |
+| **Header-based routing** | `end-user: jason` → reviews-v2 | A/B testing — route specific users to a version |
+| **DestinationRules** | Subsets map `version` labels to named groups | Tell Istio which pods belong to which version |
+
+### Resilience
+
+| Policy | Config | Purpose |
+|--------|--------|---------|
+| **Timeout** | 1s per request | Fail fast — don't hold connections to slow services |
+| **Retries** | 3 attempts, 2s per try, on 5xx/reset/connect-failure | Handle transient failures automatically |
+| **Circuit breaking** | Eject pod after 3 consecutive 5xx, 30s ejection, max 50% ejected | Isolate unhealthy pods, prevent cascading failures |
+
+### Fault Injection (Chaos Testing)
+
+Validate resilience policies by injecting failures without modifying application code:
+
+| Fault | Config | What it tests |
+|-------|--------|--------------|
+| **Delay** | 50% of ratings requests get 3s delay | Do timeouts and retries handle slow dependencies? |
+| **Abort** | 20% of ratings requests return 503 | Does the system degrade gracefully under partial failure? |
+
+### Security — Strict mTLS
+
+```
+PeerAuthentication (mode: STRICT)
+    ↓
+All service-to-service traffic encrypted with TLS 1.3
+    ↓
+Istio auto-issues and rotates certificates (24h expiry)
+    ↓
+SPIFFE identity: spiffe://cluster.local/ns/learn/sa/default
+```
+
+- Services without valid Istio-issued certificates are rejected
+- No plain-text traffic allowed between pods
+- Zero-trust: even internal cluster traffic is encrypted and authenticated
 
 ## Key Design Decisions
 
@@ -320,6 +396,9 @@ Horizontal Pod Autoscaler (HPA) configured for both web and API tiers:
 | **Pod anti-affinity for HA** | Spreads replicas across nodes so a single node failure doesn't take down an entire tier |
 | **Alertmanager with email routing** | Severity-based alerting with inhibit rules — critical alerts suppress duplicate warnings for the same issue |
 | **Persistent storage for monitoring** | PVCs for Prometheus (10Gi) and Grafana (5Gi) ensure metric data and dashboards survive pod restarts |
+| **Istio service mesh** | Provides mTLS, traffic shaping, fault injection, and circuit breaking without application code changes |
+| **Strict mTLS over permissive** | Zero-trust security — all pod-to-pod traffic encrypted; services must present valid certificates |
+| **Fault injection for chaos testing** | Validates resilience policies (timeouts, retries, circuit breaking) work before real outages occur |
 
 ## Production Roadmap
 
@@ -329,7 +408,7 @@ Improvements for a full production deployment:
 |------|------------|
 | **TLS** | Custom domain with ACM certificate on ALB (CloudFront already enforces HTTPS) |
 | **Multi-env** | Separate staging/production clusters with Terraform workspaces or Terragrunt |
-| **Network Policies** | Calico/Cilium NetworkPolicies to restrict pod-to-pod communication |
+| **Network Policies** | Istio AuthorizationPolicy for fine-grained service-to-service access control |
 | **GitOps** | ArgoCD for declarative cluster state management |
 | **Observability** | PagerDuty/Slack integrations for Alertmanager, distributed tracing with OpenTelemetry |
 | **Database** | RDS Multi-AZ for high availability, read replicas for scaling |

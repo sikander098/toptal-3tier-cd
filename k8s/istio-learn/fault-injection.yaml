@@ -1,0 +1,44 @@
+# Fault Injection — chaos testing to validate resilience policies
+# Inject failures WITHOUT modifying application code
+---
+# Delay injection — simulate slow downstream service
+# 50% of requests to ratings get a 3s artificial delay
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: ratings-delay
+  namespace: learn
+spec:
+  hosts:
+    - ratings
+  http:
+    - fault:
+        delay:
+          percentage:
+            value: 50
+          fixedDelay: 3s
+      route:
+        - destination:
+            host: ratings
+            subset: v1
+---
+# Abort injection — simulate service failure
+# 20% of requests to ratings return HTTP 503 immediately
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: ratings-abort
+  namespace: learn
+spec:
+  hosts:
+    - ratings
+  http:
+    - fault:
+        abort:
+          percentage:
+            value: 20
+          httpStatus: 503
+      route:
+        - destination:
+            host: ratings
+            subset: v1

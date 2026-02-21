@@ -1,0 +1,77 @@
+# DestinationRules — map pod labels to named subsets
+# Used by VirtualServices to route traffic to specific versions
+---
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata:
+  name: productpage
+  namespace: learn
+spec:
+  host: productpage
+  subsets:
+    - name: v1
+      labels:
+        version: v1
+---
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata:
+  name: reviews
+  namespace: learn
+spec:
+  host: reviews
+  trafficPolicy:
+    outlierDetection:
+      consecutive5xxErrors: 3    # eject pod after 3 consecutive 5xx errors
+      interval: 10s              # check every 10 seconds
+      baseEjectionTime: 30s      # ejected for 30 seconds
+      maxEjectionPercent: 50     # never eject more than 50% of pods
+  subsets:
+    - name: v1
+      labels:
+        version: v1    # no stars
+    - name: v2
+      labels:
+        version: v2    # black stars
+    - name: v3
+      labels:
+        version: v3    # red stars
+---
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata:
+  name: ratings
+  namespace: learn
+spec:
+  host: ratings
+  subsets:
+    - name: v1
+      labels:
+        version: v1
+---
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata:
+  name: details
+  namespace: learn
+spec:
+  host: details
+  subsets:
+    - name: v1
+      labels:
+        version: v1
+---
+# VirtualService — route all traffic to reviews v1 (baseline)
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: reviews
+  namespace: learn
+spec:
+  hosts:
+    - reviews
+  http:
+    - route:
+        - destination:
+            host: reviews
+            subset: v1

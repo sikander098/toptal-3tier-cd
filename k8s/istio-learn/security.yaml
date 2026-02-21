@@ -1,0 +1,13 @@
+# Istio Security — mTLS (mutual TLS) for zero-trust networking
+# All service-to-service communication is encrypted and authenticated
+---
+# Strict mTLS — reject any plain-text traffic between services
+# Istio sidecars auto-issue and rotate certificates (24h expiry)
+apiVersion: security.istio.io/v1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: learn
+spec:
+  mtls:
+    mode: STRICT
